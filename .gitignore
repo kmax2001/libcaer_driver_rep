@@ -1,0 +1,16 @@
+# colcon build artifacts
+/build/
+/install/
+/log/
+
+# vendored libcaer is fetched at build time from upstream (see
+# libcaer_vendor_eventframe/CMakeLists.txt); do not track the local clone
+/libcaer_vendor_eventframe/libcaer/
+
+# python caches
+__pycache__/
+*.py[cod]
+
+# editor / OS cruft
+*.swp
+.DS_Store

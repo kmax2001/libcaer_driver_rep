@@ -1,0 +1,840 @@
+// -*-c++-*---------------------------------------------------------------------------------------
+// Copyright 2023 Bernd Pfrommer <bernd.pfrommer@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <chrono>
+#include <cstring>
+#include <event_camera_msgs/msg/event_packet.hpp>
+#include <libcaer_driver/check_endian.hpp>
+#include <libcaer_driver/driver.hpp>
+#include <libcaer_driver/libcaer_wrapper.hpp>
+#include <libcaer_driver/logging.hpp>
+#include <libcaer_driver/message_converter.hpp>
+#include <map>
+#include <rclcpp/parameter_events_filter.hpp>
+#include <rclcpp_components/register_node_macro.hpp>
+#include <string>
+#include <vector>
+
+namespace libcaer_driver
+{
+Driver::Driver(const rclcpp::NodeOptions & options)
+: Node(
+    "libcaer_driver",
+    rclcpp::NodeOptions(options).automatically_declare_parameters_from_overrides(true))
+{
+  messageThresholdTime_ = uint64_t(std::abs(get_or("event_message_time_threshold", 1.0e-3)) * 1e9);
+  messageThresholdSize_ =
+    static_cast<size_t>(std::abs(get_or("event_message_size_threshold", int64_t(1000000000))));
+  encoding_ = get_or<std::string>("encoding", "libcaer_cmp");
+  useCompressed_ = (encoding_ == "libcaer_cmp");
+  if (encoding_ != "libcaer_cmp" && encoding_ != "libcaer") {
+    BOMB_OUT("invalid encoding: " << encoding_);
+  }
+  const std::string deviceType = get_or("device_type", std::string("davis"));
+  try {
+    wrapper_.reset(new LibcaerWrapper());
+    wrapper_->setCallbackHandler(this);
+    wrapper_->initialize(deviceType, get_or("device_id", 1), get_or("serial", std::string()));
+    // Lower libcaer's packet-container flush interval (default 10 ms).
+    // For 400 FPS / 5 ms latency we use 2500 us. Allow user override.
+    const int packetIntervalUs = get_or<int>("packet_interval_us", 10000);
+    if (packetIntervalUs > 0 && packetIntervalUs != 10000) {
+      wrapper_->setPacketContainerInterval(static_cast<uint32_t>(packetIntervalUs));
+      LOG_INFO_FMT("libcaer packet container interval set to %d us", packetIntervalUs);
+    }
+  } catch (std::runtime_error & e) {
+    BOMB_OUT("sensor initialization failed: " << e.what());
+  }
+  if (wrapper_->hasDVS()) {
+    eventPub_ = this->create_publisher<EventPacketMsg>(
+      "~/events", rclcpp::QoS(rclcpp::KeepLast(get_or("event_send_queue_size", 1000)))
+                    .best_effort()
+                    .durability_volatile());
+
+    // ---------- /events_rep (TimeSurface) ----------
+    tsEnabled_     = get_or<bool>("time_surface_enabled", true);
+    tsWindowUs_    = static_cast<uint32_t>(get_or<int>("time_surface_window_us", 3000));
+    tsNumBins_     = static_cast<uint32_t>(get_or<int>("time_surface_n_bins", 5));
+    tsTimerDriven_ = get_or<bool>("time_surface_timer_driven", true);
+    if (tsNumBins_ == 0) { tsNumBins_ = 1; }
+    tsChannels_    = 2 * tsNumBins_;
+    LOG_INFO_FMT(
+      "time_surface: enabled=%s window_us=%u n_bins=%u channels=%u timer_driven=%s",
+      tsEnabled_ ? "true" : "false", tsWindowUs_, tsNumBins_, tsChannels_,
+      tsTimerDriven_ ? "true" : "false");
+    if (tsEnabled_) {
+      repPub_ = this->create_publisher<TimeSurfaceMsg>(
+        "~/events_rep",
+        rclcpp::QoS(rclcpp::KeepLast(get_or("time_surface_queue_size", 10)))
+          .best_effort()
+          .durability_volatile());
+      // initial reserve for accumulation buffers (sensible upper bound ~100k events)
+      evBufX_.reserve(200000);
+      evBufY_.reserve(200000);
+      evBufP_.reserve(200000);
+      evBufTus_.reserve(200000);
+      evDrainX_.reserve(200000);
+      evDrainY_.reserve(200000);
+      evDrainP_.reserve(200000);
+      evDrainTus_.reserve(200000);
+    }
+  }
+  if (wrapper_->hasIMU()) {
+    imuPub_ = this->create_publisher<ImuMsg>(
+      "~/imu", rclcpp::QoS(rclcpp::KeepLast(get_or("imu_send_queue_size", 10)))
+                 .best_effort()
+                 .durability_volatile());
+  }
+#ifdef USE_PUB_THREAD
+  keepPubThreadRunning_.store(true);
+  pubThread_ = std::make_shared<std::thread>(&Driver::publishingThread, this);
+#endif
+
+  wrapper_->initializeParameters(this);
+  autoExposureEnabled_ = get_or<bool>("auto_exposure_enabled", false);
+  LOG_INFO("auto exposure enabled: " << (autoExposureEnabled_ ? "True" : "False"));
+  parameterMap_.insert(
+    {"auto_exposure_illumination", declareRosParameter(std::make_shared<RosIntParameter>(
+                                     "auto_exposure_illumination", 127, 0, 255,
+                                     "auto exposure target illumination", nullptr, FIELD_INT))});
+  targetIllumination_ = get_parameter("auto_exposure_illumination").as_int();
+  parameterMap_.insert(
+    {"auto_exposure_hysteresis", declareRosParameter(std::make_shared<RosFloatParameter>(
+                                   "auto_exposure_hysteresis", 0.0625, 0, 0.5,
+                                   "auto exposure hysteresis", nullptr, FIELD_FLOAT))});
+  exposureHysteresis_ = get_parameter("auto_exposure_hysteresis").as_double();
+
+  isMaster_ = get_or<bool>("master", true);
+  if (isMaster_) {
+    if (!wrapper_->isMaster()) {
+      LOG_ERROR("this device should be master, but the hardware says it's not!");
+    }
+    resetPub_ =
+      this->create_publisher<TimeMsg>("~/reset_timestamps", rclcpp::QoS(rclcpp::KeepLast(10)));
+  } else {
+    if (wrapper_->isMaster()) {
+      LOG_ERROR("this device is configured as slave, but the hardware says it's a master!");
+    }
+
+    resetSub_ = this->create_subscription<TimeMsg>(
+      "~/reset_timestamps", rclcpp::QoS(rclcpp::KeepLast(10)),
+      std::bind(&Driver::resetMsg, this, std::placeholders::_1));
+  }
+
+  isBigEndian_ = check_endian::isBigEndian();
+  // ------ get other parameters from camera
+  cameraFrameId_ = get_or<std::string>("camera_frame_id", "camera");
+  imuFrameId_ = get_or<std::string>("imu_frame_id", "imu");
+  dvsWidth_ = wrapper_->getDVSSizeX();
+  dvsHeight_ = wrapper_->getDVSSizeY();
+  apsWidth_ = wrapper_->getAPSSizeX();
+  apsHeight_ = wrapper_->getAPSSizeY();
+
+  LOG_INFO_FMT(
+    "res: %d x %d,  camera frame id : %s, imu frame id: %s", dvsWidth_, dvsHeight_,
+    cameraFrameId_.c_str(), imuFrameId_.c_str());
+
+  // Now that we know the DVS resolution, pre-allocate the time-surface output.
+  if (tsEnabled_ && dvsWidth_ > 0 && dvsHeight_ > 0) {
+    tsData_.assign(
+      static_cast<size_t>(tsChannels_) * dvsHeight_ * dvsWidth_, 0.0f);
+    LOG_INFO_FMT(
+      "time_surface: pre-allocated %.2f MB (%u x %u x %u floats)",
+      tsData_.size() * sizeof(float) / (1024.0 * 1024.0),
+      dvsHeight_, dvsWidth_, tsChannels_);
+  }
+
+  infoManager_ = std::make_shared<camera_info_manager::CameraInfoManager>(
+    this, get_name(), get_or<std::string>("camerainfo_url", ""));
+
+  cameraInfoMsg_ = infoManager_->getCameraInfo();
+  if (
+    ((cameraInfoMsg_.width != 0) && (cameraInfoMsg_.width != apsWidth_)) ||
+    ((cameraInfoMsg_.height != 0) && (cameraInfoMsg_.height != apsHeight_))) {
+    LOG_WARN("sensor resolution does not match calibration file!");
+  }
+  if (cameraInfoMsg_.width == 0) {
+    cameraInfoMsg_.width = apsWidth_;
+  }
+  if (cameraInfoMsg_.height == 0) {
+    cameraInfoMsg_.height = apsHeight_;
+  }
+  cameraInfoMsg_.header.frame_id = cameraFrameId_;
+
+#ifdef IMAGE_TRANSPORT_USE_QOS
+  const rclcpp::QoS qos(
+    rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_default), rmw_qos_profile_default);
+#else
+  const rmw_qos_profile_t qos = rmw_qos_profile_default;
+#endif
+
+  cameraPub_ = image_transport::create_camera_publisher(
+#ifdef IMAGE_TRANSPORT_USE_NODEINTERFACE
+    *this,
+#else
+    this,
+#endif
+    "~/image_raw", qos);
+
+  timeResetTimer_ = rclcpp::create_timer(
+    this, get_clock(), rclcpp::Duration(get_or<int>("time_reset_delay", 2), 0),
+    std::bind(&Driver::timeResetTimerExpired, this));
+
+  // Timer-driven /events_rep publish — fires at the configured window cadence
+  // so the downstream pipeline gets a uniform frame rate even when the scene
+  // is quiet (publishes an all-zero TimeSurface in that case).
+  if (tsEnabled_ && tsTimerDriven_) {
+    tsTimer_ = this->create_wall_timer(
+      std::chrono::microseconds(tsWindowUs_),
+      std::bind(&Driver::tsTimerCallback, this));
+  }
+
+  start();
+}
+
+void Driver::timeResetTimerExpired()
+{
+  timeResetTimer_->cancel();
+  resetTime();
+}
+
+void Driver::resetMsg(TimeMsg::ConstSharedPtr msg)
+{
+  // This message should only be received by the slave
+  if (wrapper_) {
+    if (wrapper_->isMaster()) {
+      LOG_WARN("master received a time reset message, why?");
+    } else {
+      rosBaseTime_ = *msg;
+    }
+  }
+}
+
+void Driver::resetTime()
+{
+  if (wrapper_) {
+    LOG_INFO("driver is resetting time stamps!");
+    wrapper_->resetTimeStamps();
+  }
+
+  if (isMaster_) {
+    // round the time to nearest microsecond so the event time stamps
+    // are prettier
+    LOG_INFO("master is sending ROS time reset message to slave");
+    rosBaseTime_ =
+      rclcpp::Time((this->get_clock()->now().nanoseconds() / 1000ULL) * 1000ULL, RCL_SYSTEM_TIME);
+    TimeMsg msg(rosBaseTime_);
+    resetPub_->publish(msg);
+  }
+}
+
+Driver::~Driver()
+{
+  stop();
+  wrapper_.reset();  // invoke destructor
+#ifdef USE_PUB_THREAD
+  if (pubThread_) {
+    {
+      keepPubThreadRunning_.store(false);
+      std::unique_lock<std::mutex> lock(pubMutex_);
+      pubCv_.notify_all();
+    }
+    pubThread_->join();
+    pubThread_.reset();
+  }
+#endif
+}
+
+std::shared_ptr<RosIntParameter> Driver::declareRosParameter(
+  const std::shared_ptr<RosIntParameter> & rp)
+{
+  const std::string & name = rp->getName();
+  rcl_interfaces::msg::ParameterDescriptor desc;
+  desc.name = name;
+  desc.description = rp->getDescription();
+  rcl_interfaces::msg::IntegerRange ir;
+  ir.from_value = rp->getMinValue();
+  ir.to_value = rp->getMaxValue();
+  ir.step = 1;
+  desc.integer_range.push_back(ir);
+
+  int32_t vRos(rp->getValue());
+  try {
+    // declare or get the parameters value if it's already declared
+    try {
+      (void)get_parameter_or<int32_t>(name, vRos, rp->getValue());
+    } catch (const rclcpp::ParameterTypeException & e) {
+      LOG_WARN("ignoring param " << name << " with invalid type!");
+    }
+    // first undeclare it so we can redeclare it with the right type
+    if (this->has_parameter(name)) {
+      this->undeclare_parameter(name);
+    }
+    vRos = this->declare_parameter(name, vRos, desc, true);
+    const int32_t vClamped = rp->clamp(vRos);
+    if (rp->getParameter()) {
+      rp->getParameter()->setValue(
+        rp->getField(), vClamped);  // libcaer_wrapper will use this for initialization
+    }
+
+    if (vClamped != vRos) {
+      LOG_INFO(name << " is outside limits, adjusted " << vRos << " -> " << vClamped);
+      this->set_parameter(rclcpp::Parameter(name, vClamped));
+    } else {
+      LOG_INFO_FMT("%-25s set to: %5d", name.c_str(), vRos);
+    }
+  } catch (const rclcpp::exceptions::InvalidParameterTypeException & e) {
+    LOG_WARN("overwriting bad param with default: " + std::string(e.what()));
+    this->undeclare_parameter(name);
+    this->declare_parameter(name, vRos, desc, true);
+  }
+  return (rp);
+}
+
+std::shared_ptr<RosFloatParameter> Driver::declareRosParameter(
+  const std::shared_ptr<RosFloatParameter> & rp)
+{
+  const std::string & name = rp->getName();
+  rcl_interfaces::msg::ParameterDescriptor desc;
+  desc.name = name;
+  desc.description = rp->getDescription();
+  rcl_interfaces::msg::FloatingPointRange fr;
+  fr.from_value = rp->getMinValue();
+  fr.to_value = rp->getMaxValue();
+  fr.step = 0;
+  desc.floating_point_range.push_back(fr);
+  float vRos(rp->getValue());
+  try {
+    // declare or get the parameters value if it's already declared
+    try {
+      (void)get_parameter_or<float>(name, vRos, rp->getValue());
+    } catch (const rclcpp::ParameterTypeException & e) {
+      LOG_WARN("ignoring param " << name << " with invalid type!");
+    }
+    // first undeclare it so we can redeclare it with the right type
+    if (this->has_parameter(name)) {
+      this->undeclare_parameter(name);
+    }
+    vRos = this->declare_parameter(name, vRos, desc, true);
+    const auto vClamped = rp->clamp(vRos);
+    auto p = rp->getParameter();
+    if (p) {
+      // libcaer_wrapper will use this for initialization
+      p->setValue(rp->getField(), vClamped);
+    }
+    if (vClamped != vRos) {
+      LOG_INFO(name << " is outside limits, adjusted " << vRos << " -> " << vClamped);
+      this->set_parameter(rclcpp::Parameter(name, vClamped));
+    } else {
+      LOG_INFO_FMT("%-25s set to: %10.5f", name.c_str(), vRos);
+    }
+  } catch (const rclcpp::exceptions::InvalidParameterTypeException & e) {
+    LOG_WARN("overwriting bad param with default: " + std::string(e.what()));
+    this->undeclare_parameter(name);
+    this->declare_parameter(name, vRos, desc, true);
+  }
+  return (rp);
+}
+
+std::shared_ptr<RosBoolParameter> Driver::declareRosParameter(
+  const std::shared_ptr<RosBoolParameter> & rp)
+{
+  const std::string & name = rp->getName();
+  rcl_interfaces::msg::ParameterDescriptor desc;
+  desc.name = name;
+  desc.description = rp->getDescription();
+  auto p = std::dynamic_pointer_cast<BooleanParameter>(rp->getParameter());
+  try {
+    if (this->has_parameter(name)) {
+      try {
+        p->setValue(this->get_parameter(name).get_value<bool>());  // get user-provided ROS value
+      } catch (const rclcpp::ParameterTypeException & e) {
+        LOG_WARN("ignoring param " << name << " with invalid type!");
+      }
+    } else {
+      p->setValue(this->declare_parameter(name, p->getValue(), desc, false));
+    }
+    LOG_INFO_FMT("%-25s set to: %5s", name.c_str(), (p->getValue() ? "True" : "False"));
+  } catch (const rclcpp::exceptions::InvalidParameterTypeException & e) {
+    LOG_WARN("overwriting bad param with default: " + std::string(e.what()));
+    this->declare_parameter(name, p->getValue(), desc, true);
+  }
+  return (rp);
+}
+
+void Driver::declareParameterCallback(const std::shared_ptr<RosParameter> & rp)
+{
+  switch (rp->getType()) {
+    case ROS_INT: {
+      declareRosParameter(std::dynamic_pointer_cast<RosIntParameter>(rp));
+      if (rp->getName() == "aps_exposure") {
+        exposureParameter_ = std::dynamic_pointer_cast<RosIntParameter>(rp);
+      }
+      break;
+    }
+    case RosParameterType::ROS_BOOL:
+      declareRosParameter(std::dynamic_pointer_cast<RosBoolParameter>(rp));
+      break;
+    default:
+      BOMB_OUT("rosparam of unknown type: " << static_cast<int>(rp->getType()));
+      break;
+  }
+  parameterMap_.insert({rp->getName(), rp});
+}
+
+void Driver::deviceDisconnectedCallback()
+{
+  if (wrapper_) {
+    wrapper_->deviceDisconnected();
+  }
+  throw(std::runtime_error("device disconnected!"));
+}
+
+void Driver::updateParameter(std::shared_ptr<RosParameter> rp, const rclcpp::ParameterValue & vArg)
+{
+  rclcpp::ParameterValue v(vArg);
+  const auto & name = rp->getName();
+  auto p = rp->getParameter();
+  if (!p) {
+    updateDriverParameter(rp, vArg);
+    return;
+  }
+  try {
+    switch (p->getCaerType()) {
+      case CaerParameterType::INTEGER: {
+        LOG_INFO("updating int " << name << " to " << v.get<int>());
+        auto ip = std::dynamic_pointer_cast<IntegerParameter>(p);
+        auto rip = std::dynamic_pointer_cast<RosIntParameter>(rp);
+        const int32_t targetVal = rip->clamp(v.get<int>());
+        ip->setValue(targetVal);
+        wrapper_->setIntegerParameter(ip);
+        if (ip->getValue() != v.get<int>()) {  // send out update to ROS world
+          this->set_parameter(rclcpp::Parameter(name, ip->getValue()));
+        }
+        break;
+      }
+      case CaerParameterType::BOOLEAN: {
+        LOG_INFO("updating bool " << name << " to " << (v.get<bool>() ? "True" : "False"));
+        auto bp = std::dynamic_pointer_cast<BooleanParameter>(p);
+        bp->setValue(v.get<bool>());
+        wrapper_->setBooleanParameter(bp);
+        if (bp->getValue() != v.get<bool>()) {  // send out update to ROS world
+          this->set_parameter(rclcpp::Parameter(name, bp->getValue()));
+        }
+        break;
+      }
+      case CaerParameterType::CF_BIAS: {
+        auto cfb = std::dynamic_pointer_cast<CoarseFineParameter>(p);
+        LOG_INFO("updating coarse-fine bias " << name << " to " << v.get<int>());
+        auto rip = std::dynamic_pointer_cast<RosIntParameter>(rp);
+        const int32_t targetVal = rip->clamp(v.get<int>());
+        cfb->setBias(rp->getField(), targetVal);  // sets coarse or fine
+        wrapper_->setCoarseFineBias(cfb);         // will update cfb with read-back value
+        const int32_t actualVal = cfb->getValue(rp->getField());  // check read back
+        if (actualVal != v.get<int>()) {                          // send out update to ROS world
+          this->set_parameter(rclcpp::Parameter(name, actualVal));
+        }
+        break;
+      }
+      case CaerParameterType::VDAC_BIAS: {
+        auto vb = std::dynamic_pointer_cast<VDACParameter>(p);
+        LOG_INFO("updating vdac bias " << name << " to " << v.get<int>());
+        auto rip = std::dynamic_pointer_cast<RosIntParameter>(rp);
+        const int32_t targetVal = rip->clamp(v.get<int>());
+        vb->setBias(rp->getField(), targetVal);
+        const int32_t actualVal = vb->getValue(rp->getField());  // check read back
+        if (actualVal != v.get<int>()) {                         // send out update to ROS world
+          this->set_parameter(rclcpp::Parameter(name, actualVal));
+        }
+        break;
+      }
+
+      default:
+        // throw(std::runtime_error("invalid parameter type!"));
+        break;
+    }
+  } catch (const rclcpp::ParameterTypeException & e) {
+    LOG_WARN("ignoring param  " << name << " with invalid type!");
+  }
+}
+
+void Driver::updateDriverParameter(
+  std::shared_ptr<RosParameter> rp, const rclcpp::ParameterValue & vArg)
+{
+  if (rp->getName() == "auto_exposure_enabled") {
+    autoExposureEnabled_ = vArg.get<bool>();
+    LOG_INFO("auto exposure enabled: " << (autoExposureEnabled_ ? "True" : "False"));
+  } else if (rp->getName() == "auto_exposure_illumination") {
+    targetIllumination_ = static_cast<int32_t>(vArg.get<int>());
+    LOG_INFO("target illumination set to: " << targetIllumination_);
+  } else if (rp->getName() == "auto_exposure_hysteresis") {
+    exposureHysteresis_ = static_cast<float>(vArg.get<double>());
+    LOG_INFO("auto exposure hysteresis set to: " << exposureHysteresis_);
+  }
+}
+
+void Driver::onParameterEvent(std::shared_ptr<const rcl_interfaces::msg::ParameterEvent> event)
+{
+  if (event->node != this->get_fully_qualified_name()) {
+    return;
+  }
+  // need to make copy to work around Foxy API
+  auto ev = std::make_shared<rcl_interfaces::msg::ParameterEvent>(*event);
+  std::vector<std::string> validEvents;
+  for (const auto & p : parameterMap_) {
+    validEvents.push_back(p.first);
+  }
+  rclcpp::ParameterEventsFilter filter(
+    ev, validEvents, {rclcpp::ParameterEventsFilter::EventType::CHANGED});
+  for (auto & ev_it : filter.get_events()) {
+    const std::string & name = ev_it.second->name;
+    auto it = parameterMap_.find(name);
+    if (it != parameterMap_.end()) {
+      updateParameter(it->second, rclcpp::ParameterValue(ev_it.second->value));
+    }
+  }
+}
+
+void Driver::start()
+{
+  double printInterval;
+  this->get_parameter_or("statistics_print_interval", printInterval, 1.0);
+  wrapper_->setStatisticsInterval(printInterval);
+
+  // ------ start camera, may get callbacks from then on
+  wrapper_->startSensor();
+
+  // listen to changes in ROS parameters
+  parameterSubscription_ = rclcpp::AsyncParametersClient::on_parameter_event(
+    this, std::bind(&Driver::onParameterEvent, this, std::placeholders::_1));
+}
+
+bool Driver::stop()
+{
+  LOG_INFO("driver stopping sensor");
+  if (wrapper_) {
+    wrapper_->stopSensor();
+    return (true);
+  }
+  return false;
+}
+
+void Driver::configureSensor() {}
+
+void Driver::polarityPacketCallback(uint64_t t, const libcaer::events::PolarityEventPacket & packet)
+{
+  // ---------- /events_rep accumulation (independent of /events) ----------
+  // Two modes:
+  //   timer-driven (default): just accumulate under lock; tsTimerCallback()
+  //     will drain and publish on a fixed cadence (window_us) so the rate is
+  //     constant regardless of event activity.
+  //   event-driven (legacy):  split per-event so a packet spanning > window
+  //     is broken into multiple messages within this callback.
+  if (tsEnabled_ && repPub_) {
+    const bool hasSub = repPub_->get_subscription_count() > 0;
+    if (hasSub) {
+      const int N = packet.getEventNumber();
+      if (tsTimerDriven_) {
+        std::lock_guard<std::mutex> lock(tsBufMutex_);
+        for (int i = 0; i < N; ++i) {
+          const auto & e = packet[i];
+          if (!e.isValid()) continue;
+          const int64_t tus = e.getTimestamp64(packet);
+          if (evBufStartTus_ < 0) evBufStartTus_ = tus;
+          evBufX_.push_back(e.getX());
+          evBufY_.push_back(e.getY());
+          evBufP_.push_back(e.getPolarity() ? 1 : 0);
+          evBufTus_.push_back(tus);
+        }
+      } else {
+        for (int i = 0; i < N; ++i) {
+          const auto & e = packet[i];
+          if (!e.isValid()) continue;
+          const int64_t tus = e.getTimestamp64(packet);
+          if (evBufStartTus_ >= 0 &&
+              (tus - evBufStartTus_) >= static_cast<int64_t>(tsWindowUs_)) {
+            computeAndPublishTimeSurface(t);
+          }
+          if (evBufStartTus_ < 0) evBufStartTus_ = tus;
+          evBufX_.push_back(e.getX());
+          evBufY_.push_back(e.getY());
+          evBufP_.push_back(e.getPolarity() ? 1 : 0);
+          evBufTus_.push_back(tus);
+        }
+      }
+    }
+  }
+  // -----------------------------------------------------------------------
+
+  if (eventPub_->get_subscription_count() > 0) {
+    if (!eventMsg_) {
+      eventMsg_.reset(new EventPacketMsg());
+      eventMsg_->header.frame_id = cameraFrameId_;
+      eventMsg_->header.stamp = rclcpp::Time(t, RCL_SYSTEM_TIME);
+      eventMsg_->encoding = encoding_;
+      eventMsg_->seq = seq_++;
+      eventMsg_->width = dvsWidth_;
+      eventMsg_->height = dvsHeight_;
+      eventMsg_->is_bigendian = isBigEndian_;
+      eventMsg_->events.reserve(reserveSize_);
+    }
+    if (useCompressed_) {
+      message_converter::convert_polarity_packet_compressed(
+        eventMsg_.get(), packet, rosBaseTime_, &sensorTime_0);
+    } else {
+      message_converter::convert_polarity_packet(eventMsg_.get(), packet, rosBaseTime_);
+    }
+
+    const auto & events = eventMsg_->events;
+    if (t - lastMessageTime_ > messageThresholdTime_ || events.size() > messageThresholdSize_) {
+      reserveSize_ = std::max(reserveSize_, events.size());
+#ifdef USE_PUB_THREAD
+      {
+        std::unique_lock<std::mutex> lock(pubMutex_);
+        pubQueue_.push(std::move(eventMsg_));
+        pubCv_.notify_all();
+      }
+#else
+      eventPub_->publish(std::move(eventMsg_));  // will reset the pointer
+#endif
+      lastMessageTime_ = t;
+      wrapper_->updateBytesSent(events.size());
+      wrapper_->updateMsgsSent(1);
+    }
+  } else {
+    if (eventMsg_) {
+      eventMsg_.reset();
+    }
+  }
+}
+
+static int32_t compute_new_exposure_time(
+  const sensor_msgs::msg::Image & img, float * illum, int32_t currentTime, int32_t targetIllum)
+{
+  const auto & im = img.data;
+  *illum = static_cast<float>(std::accumulate(im.begin(), im.end(), 0)) / im.size();
+  if (*illum == 0.0 || targetIllum / *illum > 1e3) {
+    return (std::numeric_limits<int32_t>::max());
+  }
+  const float alpha = 0.8;
+  const int32_t newTime = currentTime * pow(targetIllum / *illum, alpha);
+  return (newTime);
+}
+
+// -----------------------------------------------------------------------------
+// /events_rep — dense TimeSurface representation.
+//
+// Builds a (H, W, 2*n_bins) float32 tensor mirroring the Python reference
+// in BlinkTrack/util/representations.py::TimeSurface.
+//   - Per event: t_norm = (t - t0) / (tN - t0)         in [0, 1]
+//                bin    = clamp(floor(t_norm * n_bins), 0, n_bins-1)
+//                ch     = 2 * bin + polarity
+//                out[y, x, ch] = max(out[y, x, ch], t_norm)
+// Output is freshly zeroed each call (no leakage between windows).
+// -----------------------------------------------------------------------------
+void Driver::computeAndPublishTimeSurface(uint64_t headerStampNs)
+{
+  const size_t numEvts = evBufTus_.size();
+  if (numEvts == 0 || dvsWidth_ == 0 || dvsHeight_ == 0) {
+    evBufX_.clear(); evBufY_.clear(); evBufP_.clear(); evBufTus_.clear();
+    evBufStartTus_ = -1;
+    return;
+  }
+  const int64_t t0 = evBufStartTus_;
+  const int64_t tN = evBufTus_.back();
+  const int64_t dt = tN - t0;
+
+  // Zero the persistent output buffer.
+  std::fill(tsData_.begin(), tsData_.end(), 0.0f);
+
+  if (dt > 0) {
+    const float invDt = 1.0f / static_cast<float>(dt);
+    const size_t W = dvsWidth_;
+    const size_t H = dvsHeight_;
+    const size_t C = tsChannels_;
+    const int nb = static_cast<int>(tsNumBins_);
+    for (size_t i = 0; i < numEvts; ++i) {
+      const int64_t te = evBufTus_[i] - t0;
+      const float t_norm = static_cast<float>(te) * invDt;  // [0, 1]
+      int bin = static_cast<int>(t_norm * static_cast<float>(nb));
+      if (bin >= nb) { bin = nb - 1; }
+      if (bin < 0) { bin = 0; }
+      const uint16_t x = evBufX_[i];
+      const uint16_t y = evBufY_[i];
+      const uint8_t  p = evBufP_[i];
+      if (x >= W || y >= H || p > 1) {
+        continue;
+      }
+      const size_t idx = (static_cast<size_t>(y) * W + x) * C + static_cast<size_t>(2 * bin + p);
+      if (t_norm > tsData_[idx]) {
+        tsData_[idx] = t_norm;
+      }
+    }
+  }
+
+  // Assemble + publish.
+  auto msg = std::make_unique<TimeSurfaceMsg>();
+  msg->header.stamp = rclcpp::Time(headerStampNs, RCL_SYSTEM_TIME);
+  msg->header.frame_id = cameraFrameId_;
+  msg->height = dvsHeight_;
+  msg->width = dvsWidth_;
+  msg->channels = tsChannels_;
+  msg->n_bins = tsNumBins_;
+  msg->window_start_us = static_cast<uint64_t>(t0);
+  msg->window_end_us = static_cast<uint64_t>(tN);
+  msg->data.resize(tsData_.size());
+  std::memcpy(msg->data.data(), tsData_.data(), tsData_.size() * sizeof(float));
+  repPub_->publish(std::move(msg));
+
+  // Reset accumulation for the next window (preserve capacity).
+  evBufX_.clear(); evBufY_.clear(); evBufP_.clear(); evBufTus_.clear();
+  evBufStartTus_ = -1;
+}
+
+// Fires every tsWindowUs_ μs on the rclcpp executor thread. Drains the
+// accumulator under a brief lock (cheap vector swaps) and then computes /
+// publishes outside the lock so the processing thread (which only appends
+// under the same lock) is never blocked on the heavy memcpy.
+void Driver::tsTimerCallback()
+{
+  if (!tsEnabled_ || !repPub_) return;
+
+  // 1) Drain accumulators under lock (cheap O(1) swaps).
+  int64_t startTus = -1;
+  {
+    std::lock_guard<std::mutex> lock(tsBufMutex_);
+    evBufX_.swap(evDrainX_);
+    evBufY_.swap(evDrainY_);
+    evBufP_.swap(evDrainP_);
+    evBufTus_.swap(evDrainTus_);
+    std::swap(startTus, evBufStartTus_);  // evBufStartTus_ <- -1, startTus <- old start
+    evBufX_.clear(); evBufY_.clear(); evBufP_.clear(); evBufTus_.clear();
+  }
+
+  const uint64_t headerStampNs =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+
+  // Skip work entirely if no subscriber.
+  if (repPub_->get_subscription_count() == 0) {
+    return;
+  }
+
+  // 2) Zero the persistent output buffer.
+  std::fill(tsData_.begin(), tsData_.end(), 0.0f);
+
+  const size_t N = evDrainTus_.size();
+  const int64_t t0 = (startTus >= 0) ? startTus : 0;
+  const int64_t tN = (N > 0) ? evDrainTus_.back() : 0;
+  const int64_t dt = tN - t0;
+
+  // 3) Fill output if we have events spanning a positive duration.
+  if (N > 0 && dt > 0) {
+    const float invDt = 1.0f / static_cast<float>(dt);
+    const size_t W = dvsWidth_;
+    const size_t H = dvsHeight_;
+    const size_t C = tsChannels_;
+    const int nb = static_cast<int>(tsNumBins_);
+    for (size_t i = 0; i < N; ++i) {
+      const int64_t te = evDrainTus_[i] - t0;
+      const float t_norm = static_cast<float>(te) * invDt;
+      int bin = static_cast<int>(t_norm * static_cast<float>(nb));
+      if (bin >= nb) bin = nb - 1;
+      if (bin < 0) bin = 0;
+      const uint16_t x = evDrainX_[i];
+      const uint16_t y = evDrainY_[i];
+      const uint8_t  p = evDrainP_[i];
+      if (x >= W || y >= H || p > 1) continue;
+      const size_t idx = (static_cast<size_t>(y) * W + x) * C + static_cast<size_t>(2 * bin + p);
+      if (t_norm > tsData_[idx]) tsData_[idx] = t_norm;
+    }
+  }
+
+  // 4) Build + publish the message (zeros if no events).
+  auto msg = std::make_unique<TimeSurfaceMsg>();
+  msg->header.stamp = rclcpp::Time(headerStampNs, RCL_SYSTEM_TIME);
+  msg->header.frame_id = cameraFrameId_;
+  msg->height = dvsHeight_;
+  msg->width = dvsWidth_;
+  msg->channels = tsChannels_;
+  msg->n_bins = tsNumBins_;
+  msg->window_start_us = static_cast<uint64_t>(t0);
+  msg->window_end_us = static_cast<uint64_t>(tN);
+  msg->data.resize(tsData_.size());
+  std::memcpy(msg->data.data(), tsData_.data(), tsData_.size() * sizeof(float));
+  repPub_->publish(std::move(msg));
+}
+
+void Driver::framePacketCallback(const libcaer::events::FrameEventPacket & packet)
+{
+  if (cameraPub_.getNumSubscribers() > 0) {
+    std::vector<std::unique_ptr<sensor_msgs::msg::Image>> msgs;
+    (void)message_converter::convert_frame_packet(&msgs, packet, cameraFrameId_, rosBaseTime_);
+    for (auto & img : msgs) {
+      sensor_msgs::msg::CameraInfo::UniquePtr cinfo(
+        new sensor_msgs::msg::CameraInfo(cameraInfoMsg_));
+      const int32_t currentTime = wrapper_->getExposureTime();
+      if (autoExposureEnabled_ && exposureParameter_) {
+        if (frameDelay_ == 0) {
+          float illum;
+          int32_t newTime =
+            compute_new_exposure_time(*img, &illum, currentTime, targetIllumination_);
+          newTime = exposureParameter_->clamp(newTime);
+          if (abs(newTime - currentTime) > static_cast<int>(currentTime * exposureHysteresis_)) {
+            LOG_INFO_FMT(
+              "autoexp: illum: %12.5f, exp time: %5d -> %5d", illum, currentTime, newTime);
+            wrapper_->setExposureTime(newTime);
+            this->set_parameter(rclcpp::Parameter("aps_exposure", newTime));
+            frameDelay_ = 1;
+          }
+        } else {
+          frameDelay_--;
+        }
+      }
+      cameraPub_.publish(std::move(img), std::move(cinfo));
+    }
+  }
+}
+
+void Driver::imu6PacketCallback(const libcaer::events::IMU6EventPacket & packet)
+{
+  if (imuPub_->get_subscription_count() > 0) {
+    std::vector<std::unique_ptr<sensor_msgs::msg::Imu>> msgs;
+    (void)message_converter::convert_imu6_packet(&msgs, packet, imuFrameId_, rosBaseTime_);
+    for (auto & msg : msgs) {
+      imuPub_->publish(std::move(msg));
+    }
+  }
+}
+
+#ifdef USE_PUB_THREAD
+void Driver::publishingThread()
+{
+  const auto duration = std::chrono::milliseconds(100);
+  while (rclcpp::ok() && keepPubThreadRunning_.load()) {
+    std::unique_lock<std::mutex> lock(pubMutex_);
+    pubCv_.wait_for(lock, duration);
+    while (!pubQueue_.empty()) {
+      eventPub_->publish(std::move(pubQueue_.front()));
+      pubQueue_.pop();
+    }
+  }
+  LOG_INFO("publishing thread exited!");
+}
+#endif
+
+}  // namespace libcaer_driver
+
+RCLCPP_COMPONENTS_REGISTER_NODE(libcaer_driver::Driver)

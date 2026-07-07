@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model
+  href="http://download.ros.org/schema/package_format2.xsd"
+  schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="2">
+  <name>libcaer_vendor_eventframe</name>
+  <version>1.0.0</version>
+  <description>
+    Wrapper around libcaer library (local fork) — builds libcaer from ./libcaer/.
+  </description>
+
+  <maintainer email="visionandrobot@gmail.com">kyh</maintainer>
+
+  <license>Apache License 2.0</license>  <!-- this package is Apache 2.0 -->
+  <license>BSD-2</license>  <!-- libcaer is BSD-2 and some Apache 2.0 -->
+
+  <author email="bernd.pfrommer@gmail.com">Bernd Pfrommer</author>
+
+  <url type="website">https://gitlab.com/inivation/dv/libcaer</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_vendor_package</buildtool_depend>
+
+
+  <!-- libcaer dependencies -->
+  <depend>libusb-1.0-dev</depend>
+  <build_depend>pkg-config</build_depend>
+  <build_depend>cmake</build_depend>
+  <test_depend>gtest</test_depend>
+  
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
