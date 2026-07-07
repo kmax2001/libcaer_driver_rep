@@ -87,6 +87,8 @@ install(TARGETS
 install(PROGRAMS
   src/stop_recording.py
   src/timesurface_vis_node.py
+  src/blinktrack_core.py
+  src/blinktrack_node.py
   DESTINATION lib/${PROJECT_NAME}/)
 
 install(DIRECTORY
