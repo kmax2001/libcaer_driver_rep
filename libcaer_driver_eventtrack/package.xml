@@ -21,6 +21,8 @@
   <depend>camera_info_manager</depend>
   <depend>sensor_msgs</depend>
   <depend>image_transport</depend>
+  <depend>geometry_msgs</depend> <!-- BlinkTrack tracker: PointStamped track output -->
+  <depend>std_msgs</depend> <!-- RL-log trigger (Empty) -->
 
   <!-- python TimeSurface visualization node (timesurface_vis_node.py) -->
   <exec_depend>rclpy</exec_depend>

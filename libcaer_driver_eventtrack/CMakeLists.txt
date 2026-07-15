@@ -70,6 +70,68 @@ rclcpp_components_register_nodes(driver "libcaer_driver::Driver")
 add_executable(driver_node src/driver_node.cpp)
 target_link_libraries(driver_node driver)
 
+# ================= BlinkTrack C++ tracker (optional) =================
+# Needs libtorch (pip wheel, ABI=0) + torch_tensorrt. Enable at colcon configure:
+#   colcon build --packages-select libcaer_driver_eventtrack --cmake-args \
+#     -DTorch_DIR=<site-packages>/torch/share/cmake/Torch \
+#     -DTORCHTRT_RUNTIME=<site-packages>/torch_tensorrt/lib/libtorchtrt_runtime.so \
+#     -DCUDAToolkit_ROOT=/usr/local/cuda -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+# The torch pipeline lives in its OWN ABI=0 shared lib behind a C-ABI; the ABI=1
+# rclcpp component dlopens it with RTLD_DEEPBIND (see src/tracker/*). This is the
+# only way to co-host libtorch(ABI=0) + rclcpp(ABI=1) in one process.
+# Set arch explicitly so Torch skips CUDA GPU auto-detection (its try_run would
+# inherit this project's CXX_STANDARD=20 as CUDA20 and fail w/o CUDA lang enabled).
+if(NOT DEFINED TORCH_CUDA_ARCH_LIST)
+  set(TORCH_CUDA_ARCH_LIST "7.5")  # NVIDIA TITAN RTX; override via -DTORCH_CUDA_ARCH_LIST=...
+endif()
+find_package(Torch QUIET)
+if(Torch_FOUND)
+  find_package(geometry_msgs REQUIRED)
+  find_package(std_msgs REQUIRED)
+  if(NOT DEFINED TORCHTRT_RUNTIME)
+    set(TORCHTRT_RUNTIME "${Torch_DIR}/../../../torch_tensorrt/lib/libtorchtrt_runtime.so")
+  endif()
+
+  # --- ABI=0 pipeline shared lib (owns ALL libtorch/torch_tensorrt symbols) ---
+  add_library(blinktrack_pipeline SHARED src/tracker/blinktrack_pipeline.cpp)
+  target_include_directories(blinktrack_pipeline PUBLIC src/tracker)
+  target_link_libraries(blinktrack_pipeline PRIVATE
+    -Wl,--no-as-needed "${TORCHTRT_RUNTIME}" -Wl,--as-needed "${TORCH_LIBRARIES}")
+  target_compile_options(blinktrack_pipeline PRIVATE -w -D_GLIBCXX_USE_CXX11_ABI=0)
+  set_target_properties(blinktrack_pipeline PROPERTIES CXX_STANDARD 17)
+  install(TARGETS blinktrack_pipeline DESTINATION lib)
+
+  # --- ABI=1 composable component (dlopens the ABI=0 lib w/ RTLD_DEEPBIND) ---
+  add_library(blinktrack_tracker SHARED src/tracker/blinktrack_tracker_node.cpp)
+  target_include_directories(blinktrack_tracker PRIVATE src/tracker)
+  target_compile_definitions(blinktrack_tracker PRIVATE BLINKTRACK_COMPONENT_ONLY)
+  target_compile_options(blinktrack_tracker PRIVATE -w)
+  target_link_libraries(blinktrack_tracker
+    ${rclcpp_components_TARGETS} rclcpp::rclcpp ${geometry_msgs_TARGETS}
+    ${sensor_msgs_TARGETS} ${std_msgs_TARGETS}
+    ${libcaer_driver_eventframe_msgs_TARGETS} ${CMAKE_DL_LIBS})
+  rclcpp_components_register_nodes(blinktrack_tracker "BlinkTrackTrackerNode")
+  install(TARGETS blinktrack_tracker DESTINATION lib)
+
+  # --- standalone executable (same source, with main()) ---
+  add_executable(blinktrack_tracker_node src/tracker/blinktrack_tracker_node.cpp)
+  target_include_directories(blinktrack_tracker_node PRIVATE src/tracker)
+  target_compile_options(blinktrack_tracker_node PRIVATE -w)
+  target_link_libraries(blinktrack_tracker_node
+    ${rclcpp_components_TARGETS} rclcpp::rclcpp ${geometry_msgs_TARGETS}
+    ${sensor_msgs_TARGETS} ${std_msgs_TARGETS}
+    ${libcaer_driver_eventframe_msgs_TARGETS} ${CMAKE_DL_LIBS})
+  install(TARGETS blinktrack_tracker_node DESTINATION lib/${PROJECT_NAME}/)
+
+  # install model engines/weights if present (gitignored; large .ts files)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/models/te.ts")
+    install(DIRECTORY models DESTINATION share/${PROJECT_NAME}/)
+  endif()
+  message(STATUS "BlinkTrack tracker: ENABLED")
+else()
+  message(STATUS "BlinkTrack tracker: DISABLED (pass -DTorch_DIR=... to enable)")
+endif()
+
 
 # the node must go into the project specific lib directory or else
 # the launch file will not find it
@@ -87,6 +149,8 @@ install(TARGETS
 install(PROGRAMS
   src/stop_recording.py
   src/timesurface_vis_node.py
+  src/reinit_click_node.py
+  src/log_view.py
   src/blinktrack_core.py
   src/blinktrack_node.py
   DESTINATION lib/${PROJECT_NAME}/)

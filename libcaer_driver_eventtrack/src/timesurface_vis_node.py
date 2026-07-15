@@ -28,15 +28,39 @@
 # is simply transposed to (C, H, W) and fed to the same routine, giving output
 # identical to the reference pipeline.
 
-from collections import Counter
+from collections import Counter, deque
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
+from geometry_msgs.msg import PointStamped
 from libcaer_driver_eventframe_msgs.msg import TimeSurface
 from sensor_msgs.msg import Image
+
+
+def draw_marker(img, x, y, fired):
+    """Draw a crosshair + box at (x, y) on an (H, W, 3) uint8 image (numpy only).
+    Green when the tracker fired this frame, orange while accumulating."""
+    H, W = img.shape[:2]
+    cx, cy = int(round(x)), int(round(y))
+    color = np.array([0, 220, 0] if fired else [255, 150, 0], dtype=np.uint8)
+    r = 15  # crosshair arm length / box half-size (~ patch region)
+    x0, x1 = max(0, cx - r), min(W - 1, cx + r)
+    y0, y1 = max(0, cy - r), min(H - 1, cy + r)
+    if 0 <= cy < H:
+        img[cy, x0:x1 + 1] = color                 # horizontal crosshair
+    if 0 <= cx < W:
+        img[y0:y1 + 1, cx] = color                 # vertical crosshair
+    if 0 <= cy - r < H:
+        img[cy - r, x0:x1 + 1] = color             # box top
+    if 0 <= cy + r < H:
+        img[cy + r, x0:x1 + 1] = color             # box bottom
+    if 0 <= cx - r < W:
+        img[y0:y1 + 1, cx - r] = color             # box left
+    if 0 <= cx + r < W:
+        img[y0:y1 + 1, cx + r] = color             # box right
 
 
 def time_surface_to_rgb(event_voxel):
@@ -88,9 +112,16 @@ class TimeSurfaceVisNode(Node):
             'input_topic', '/event_camera/events_rep').value
         self.output_topic = self.declare_parameter(
             'output_topic', '/event_camera/events_rep_image').value
+        self.track_topic = self.declare_parameter(
+            'track_topic', '/blinktrack_tracker/track').value
         self.rate = float(self.declare_parameter('rate', 5.0).value)
         if self.rate <= 0.0:
             self.rate = 5.0
+        self._track = None  # (x, y, fired, stamp_ns) latest keypoint
+        # buffer recent TimeSurface frames so the marker can be drawn on the frame
+        # it was actually computed from (the /track for frame N arrives after the
+        # vis already has N+1 -> drawing latest-track on latest-image lags ~1 frame).
+        self._buf = deque(maxlen=40)   # (stamp_ns, msg)
 
         # match the driver's ~/events_rep QoS (best_effort, volatile, keep last)
         qos = QoSProfile(depth=5)
@@ -98,10 +129,11 @@ class TimeSurfaceVisNode(Node):
         qos.history = HistoryPolicy.KEEP_LAST
 
         self._latest = None       # most recent TimeSurface msg (unprocessed)
-        self._last_done = None    # identity of the last processed msg
 
         self.sub = self.create_subscription(
             TimeSurface, self.input_topic, self._on_msg, qos)
+        self.track_sub = self.create_subscription(
+            PointStamped, self.track_topic, self._on_track, 10)
         self.pub = self.create_publisher(Image, self.output_topic, qos)
         self.timer = self.create_timer(1.0 / self.rate, self._on_timer)
 
@@ -109,15 +141,30 @@ class TimeSurfaceVisNode(Node):
             f'timesurface_vis: {self.input_topic} -> {self.output_topic} '
             f'@ {self.rate:.1f} fps')
 
+    @staticmethod
+    def _stamp_ns(h):
+        return h.stamp.sec * 1_000_000_000 + h.stamp.nanosec
+
     def _on_msg(self, msg):
-        # Cheap: just keep the latest reference; heavy work happens in the timer.
+        # Cheap: buffer the frame (with stamp) + keep the latest; work in the timer.
+        self._buf.append((self._stamp_ns(msg.header), msg))
         self._latest = msg
 
+    def _on_track(self, msg):
+        self._track = (msg.point.x, msg.point.y, msg.point.z > 0.5,
+                       self._stamp_ns(msg.header))
+
     def _on_timer(self):
-        msg = self._latest
-        if msg is None or msg is self._last_done:
-            return  # nothing new since last publish
-        self._last_done = msg
+        # Time-align: draw the marker on the events_rep frame whose stamp matches
+        # the latest track (so the marker sits on the events it was computed from).
+        # Falls back to the latest frame before any track arrives.
+        if self._track is not None and self._buf:
+            ts = self._track[3]
+            msg = min(self._buf, key=lambda kv: abs(kv[0] - ts))[1]
+        else:
+            msg = self._latest
+        if msg is None:
+            return
 
         if msg.height == 0 or msg.width == 0 or msg.channels == 0:
             return
@@ -133,6 +180,9 @@ class TimeSurfaceVisNode(Node):
         voxel = np.transpose(arr, (2, 0, 1)).copy()
         img = time_surface_to_rgb(voxel)  # (H, W, 3) uint8 RGB
         img = np.ascontiguousarray(img)
+
+        if self._track is not None:
+            draw_marker(img, self._track[0], self._track[1], self._track[2])
 
         out = Image()
         out.header = msg.header  # preserve stamp / frame_id
